@@ -1,0 +1,22 @@
+/*
+ * ScVpiHandle.icc - Common VPI handle base class implementation
+ *
+ * SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework
+ * Created: 2026-07-14
+ * Author: Kaustubh <nayakkaustubh@gmail.com>
+ */
+
+#include "ScVpiHandle.h"
+
+namespace scvpi {
+
+ScVpiHandle::ScVpiHandle(ScVpiHandleKind kind) : m_kind(kind) {
+	// TODO Auto-generated constructor stub
+
+}
+
+ScVpiHandle::~ScVpiHandle() {
+	// TODO Auto-generated destructor stub
+}
+
+}

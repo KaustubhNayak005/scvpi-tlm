@@ -1,0 +1,921 @@
+/*
+ * vpi.icc - SystemC-backed VPI implementation
+ *
+ * SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework
+ * Created: 2026-07-14
+ * Author: Kaustubh <nayakkaustubh@gmail.com>
+ *
+ * Provides the VPI handle registry, hierarchy discovery, signal access,
+ * callback dispatch, and write synchronization required by cocotb and PyUVM.
+ */
+
+#pragma once
+
+#include <systemc>
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cstdarg>
+#include <cstdio>
+#include <cmath>
+#include <algorithm>
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include "vpi_user_int.h"
+
+#ifndef vpiInstance
+#define vpiInstance vpiModule
+#endif
+
+#include "ScVpiCallbackBase.h"
+#include "scvpi.h"
+
+using namespace scvpi;
+
+#ifdef EN_DEBUG_VPI
+#define DEBUG_ENTER(fmt, ...) \
+    fprintf(stdout, "--> VPI: "); \
+    fprintf(stdout, fmt, ##__VA_ARGS__); \
+    fprintf(stdout, "\n"); fflush(stdout)
+#define DEBUG_LEAVE(fmt, ...) \
+    fprintf(stdout, "<-- VPI: "); \
+    fprintf(stdout, fmt, ##__VA_ARGS__); \
+    fprintf(stdout, "\n"); fflush(stdout)
+#define DEBUG(fmt, ...) \
+    fprintf(stdout, "VPI: "); \
+    fprintf(stdout, fmt, ##__VA_ARGS__); \
+    fprintf(stdout, "\n"); fflush(stdout)
+#else
+#define DEBUG_ENTER(fmt, ...)
+#define DEBUG_LEAVE(fmt, ...)
+#define DEBUG(fmt, ...)
+#endif
+
+// Enable transaction logging when SCVPI_LOG is non-zero (default: off)
+static bool scvpi_log_enabled() {
+    static const bool enabled = []() {
+        const char* e = std::getenv("SCVPI_LOG");
+        return e && std::atoi(e) != 0;
+    }();
+    return enabled;
+}
+
+#define SCLOG(fmt, ...) do { \
+    if (scvpi_log_enabled()) { \
+        const double sec = sc_core::sc_time_stamp().to_seconds(); \
+        const long double ns_ld = static_cast<long double>(sec) * 1.0e9L; \
+        const unsigned long long ns = (unsigned long long)std::floor(ns_ld + 0.5L); \
+        fprintf(stdout, "%lluns SCVPI: " fmt "\n", ns, ##__VA_ARGS__); \
+        fflush(stdout); \
+    } \
+} while (0)
+
+enum SignalKind {
+    SigUnknown = 0,
+    SigBool,
+    SigInt32,
+    SigInt4,
+    SigUInt3,
+    SigUInt4,
+    SigUInt5,
+    SigUInt8,
+    SigUInt9,
+    SigUInt16,
+    SigUInt32
+};
+
+struct HandleRec {
+    std::string         fqname;
+    PLI_INT32           vpi_type = 0;
+    sc_core::sc_object *obj      = nullptr;
+    SignalKind          kind     = SigUnknown;
+    int                 width    = 1;
+};
+
+struct IterRec {
+    std::vector<vpiHandle> elems;
+    size_t idx = 0;
+};
+
+struct PendingWrite {
+    vpiHandle handle = nullptr;
+    int       value  = 0;
+};
+
+struct CbRec {
+    p_cb_data data = nullptr;
+};
+
+static std::map<std::string, sc_core::sc_object*> g_name2obj;
+static std::unordered_map<vpiHandle, std::unique_ptr<HandleRec>> g_handles;
+static std::unordered_map<vpiHandle, std::unique_ptr<IterRec>>   g_iters;
+static std::unordered_map<vpiHandle, std::unique_ptr<CbRec>>     g_cbs;
+static std::vector<vpiHandle> g_start_cbs;
+static std::vector<vpiHandle> g_end_cbs;
+
+static sc_core::sc_event          g_write_ev;
+static std::vector<PendingWrite>  g_pending_writes;
+static std::mutex                 g_write_mtx;
+static bool                       g_write_ev_pending = false;
+static bool                       g_driver_started   = false;
+
+static SignalKind classify(sc_core::sc_object *obj, int &width_out) {
+    width_out = 1;
+    if (!obj) return SigUnknown;
+
+    if (dynamic_cast<sc_core::sc_signal<bool>*>(obj))               { width_out = 1;  return SigBool;   }
+    if (dynamic_cast<sc_core::sc_signal<int>*>(obj))                { width_out = 32; return SigInt32;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_int<4>>*>(obj))   { width_out = 4;  return SigInt4;   }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<3>>*>(obj))  { width_out = 3;  return SigUInt3;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<4>>*>(obj))  { width_out = 4;  return SigUInt4;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<5>>*>(obj))  { width_out = 5;  return SigUInt5;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<8>>*>(obj))  { width_out = 8;  return SigUInt8;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<9>>*>(obj))  { width_out = 9;  return SigUInt9;  }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<16>>*>(obj)) { width_out = 16; return SigUInt16; }
+    if (dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<32>>*>(obj)) { width_out = 32; return SigUInt32; }
+
+    return SigUnknown;
+}
+
+static inline std::string parent_of(const std::string& s) {
+    auto pos = s.rfind('.');
+    if (pos == std::string::npos) return std::string();
+    return s.substr(0, pos);
+}
+
+static bool is_immediate_child_of(const std::string& child, const std::string& parent) {
+    if (parent.empty()) return child.find('.') == std::string::npos;
+    if (child.rfind(parent + ".", 0) != 0) return false;
+    const std::string rest = child.substr(parent.size() + 1);
+    return rest.find('.') == std::string::npos;
+}
+
+static sc_core::sc_time sc_time_from_vpi(const s_vpi_time& t) {
+    if (t.type == vpiSimTime) {
+        const uint64_t ns = (static_cast<uint64_t>(t.high) << 32) | t.low;
+        return sc_core::sc_time(static_cast<double>(ns), sc_core::SC_NS);
+    }
+    return sc_core::SC_ZERO_TIME;
+}
+
+static vpiHandle make_handle(const std::string& fqname, PLI_INT32 t) {
+    auto rec = std::make_unique<HandleRec>();
+    rec->fqname   = fqname;
+    rec->vpi_type = t;
+
+    auto itO = g_name2obj.find(fqname);
+    if (itO != g_name2obj.end()) {
+        rec->obj  = itO->second;
+        rec->kind = classify(rec->obj, rec->width);
+    }
+
+    vpiHandle raw = reinterpret_cast<vpiHandle>(rec.get());
+    g_handles.emplace(raw, std::move(rec));
+    return raw;
+}
+
+static std::string fq_from_scope_and_name(vpiHandle scope, const char* name) {
+    if (!name || !*name) return "";
+    if (g_name2obj.count(name)) return std::string(name);
+    if (!scope) return std::string(name);
+
+    auto itH = g_handles.find(scope);
+    if (itH == g_handles.end()) return std::string(name);
+
+    const std::string &parent = itH->second->fqname;
+    return parent.empty() ? std::string(name) : (parent + "." + name);
+}
+
+static void register_object(const std::string& fqname, sc_core::sc_object* obj) {
+    g_name2obj[fqname] = obj;
+}
+
+static void register_hierarchy(sc_core::sc_object* root, const std::string& prefix) {
+    if (!root) return;
+
+    const std::string myname = prefix.empty()
+        ? root->name()
+        : (prefix + "." + root->basename());
+
+    register_object(myname, root);
+
+    const std::vector<sc_core::sc_object*>& kids = root->get_child_objects();
+    for (auto* k : kids) register_hierarchy(k, myname);
+}
+
+static void collect_children(PLI_INT32 type, const std::string& parent_fq, std::vector<vpiHandle>& out) {
+    for (auto &kv : g_name2obj) {
+        const std::string &name = kv.first;
+        if (!is_immediate_child_of(name, parent_fq)) continue;
+
+        sc_core::sc_object* o = kv.second;
+
+        if ((type == vpiInstance || type == vpiModule) && dynamic_cast<sc_core::sc_module*>(o)) {
+            out.push_back(make_handle(name, vpiModule));
+            continue;
+        }
+
+        if (type == vpiIntegerVar) {
+            int w = 1;
+            SignalKind k = classify(o, w);
+            if (k == SigInt32 || k == SigInt4 ||
+                k == SigUInt3 || k == SigUInt4 || k == SigUInt5 ||
+                k == SigUInt8 || k == SigUInt9 || k == SigUInt16 ||
+                k == SigUInt32) {
+                out.push_back(make_handle(name, vpiIntegerVar));
+                continue;
+            }
+        }
+
+        if (type == vpiNet) {
+            int w = 1;
+            if (classify(o, w) == SigBool) {
+                out.push_back(make_handle(name, vpiNet));
+                continue;
+            }
+        }
+    }
+}
+
+static void start_driver_if_needed() {
+    if (g_driver_started) return;
+    g_driver_started = true;
+
+    sc_core::sc_spawn([]() {
+        while (true) {
+            sc_core::wait(g_write_ev);
+
+            std::vector<PendingWrite> local;
+            {
+                std::lock_guard<std::mutex> lk(g_write_mtx);
+                g_write_ev_pending = false;
+                local.swap(g_pending_writes);
+            }
+
+            for (const auto &w : local) {
+                auto itH = g_handles.find(w.handle);
+                if (itH == g_handles.end()) continue;
+
+                HandleRec *h = itH->second.get();
+                sc_core::sc_object *o = h->obj;
+
+                if (!o) {
+                    auto itO = g_name2obj.find(h->fqname);
+                    if (itO == g_name2obj.end()) continue;
+                    o = itO->second;
+                    h->obj  = o;
+                    h->kind = classify(o, h->width);
+                }
+
+                if (!o || h->kind == SigUnknown) continue;
+
+                const int ival = w.value;
+
+                switch (h->kind) {
+                case SigInt32:
+                    static_cast<sc_core::sc_signal<int>*>(o)->write(ival);
+                    break;
+                case SigInt4:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_int<4>>*>(o)->write(static_cast<int>(ival));
+                    break;
+                case SigBool:
+                    static_cast<sc_core::sc_signal<bool>*>(o)->write(ival != 0);
+                    break;
+                case SigUInt3:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<3>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt4:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<4>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt5:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<5>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt8:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<8>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt9:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<9>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt16:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<16>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                case SigUInt32:
+                    static_cast<sc_core::sc_signal<sc_dt::sc_uint<32>>*>(o)->write(static_cast<unsigned int>(ival));
+                    break;
+                default:
+                    break;
+                }
+            }
+        }
+    }, sc_core::sc_gen_unique_name("scvpi_write_driver"));
+}
+
+extern "C" void scvpi_autoregister_all() {
+    const std::vector<sc_core::sc_object*>& tops = sc_core::sc_get_top_level_objects();
+    for (auto* t : tops) register_hierarchy(t, "");
+}
+
+extern "C" void scvpi_fire_start_of_sim() {
+    for (auto h : g_start_cbs) {
+        auto it = g_cbs.find(h);
+        if (it == g_cbs.end()) continue;
+        p_cb_data d = it->second->data;
+        if (d && d->cb_rtn) d->cb_rtn(d);
+    }
+}
+
+extern "C" void scvpi_fire_end_of_sim() {
+    for (auto h : g_end_cbs) {
+        auto it = g_cbs.find(h);
+        if (it == g_cbs.end()) continue;
+        p_cb_data d = it->second->data;
+        if (d && d->cb_rtn) d->cb_rtn(d);
+    }
+}
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+vpiHandle vpi_register_cb(p_cb_data data) {
+    DEBUG_ENTER("vpi_register_cb");
+    if (!data || !data->cb_rtn) {
+        DEBUG_LEAVE("vpi_register_cb (null)");
+        return nullptr;
+    }
+
+    auto store_cb = [data](const char *tag) -> vpiHandle {
+        auto rec = std::make_unique<CbRec>();
+        rec->data = data;
+        vpiHandle h = make_handle(tag, vpiCallback);
+        g_cbs.emplace(h, std::move(rec));
+        return h;
+    };
+
+    if (data->reason == cbAfterDelay) {
+        vpiHandle h = store_cb("cbAfterDelay");
+        const sc_core::sc_time delay = data->time ? sc_time_from_vpi(*data->time) : sc_core::SC_ZERO_TIME;
+
+        sc_core::sc_spawn([h, delay]() {
+            sc_core::wait(delay);
+            auto it = g_cbs.find(h);
+            if (it != g_cbs.end() && it->second->data && it->second->data->cb_rtn) {
+                it->second->data->cb_rtn(it->second->data);
+            }
+        }, sc_core::sc_gen_unique_name("scvpi_cbAfterDelay"));
+
+        DEBUG_LEAVE("vpi_register_cb (cbAfterDelay)");
+        return h;
+    }
+
+    if (data->reason == cbStartOfSimulation) {
+        vpiHandle h = store_cb("cbStartOfSimulation");
+        g_start_cbs.push_back(h);
+        ScVpi::inst()->add_start_of_sim_cb(new ScVpiCallbackBase(data));
+        DEBUG_LEAVE("vpi_register_cb (cbStartOfSimulation)");
+        return h;
+    }
+
+    if (data->reason == cbEndOfSimulation) {
+        vpiHandle h = store_cb("cbEndOfSimulation");
+        g_end_cbs.push_back(h);
+        ScVpi::inst()->add_end_of_sim_cb(new ScVpiCallbackBase(data));
+        DEBUG_LEAVE("vpi_register_cb (cbEndOfSimulation)");
+        return h;
+    }
+
+    if (data->reason == cbReadWriteSynch || data->reason == cbReadOnlySynch) {
+        const char *tag = (data->reason == cbReadWriteSynch) ? "cbReadWriteSynch" : "cbReadOnlySynch";
+        vpiHandle h = store_cb(tag);
+
+        sc_core::sc_spawn([h]() {
+            sc_core::wait(sc_core::SC_ZERO_TIME);
+            auto it = g_cbs.find(h);
+            if (it != g_cbs.end() && it->second->data && it->second->data->cb_rtn) {
+                it->second->data->cb_rtn(it->second->data);
+            }
+        }, sc_core::sc_gen_unique_name("scvpi_cbSync"));
+
+        DEBUG_LEAVE("vpi_register_cb (cbSync)");
+        return h;
+    }
+
+    if (data->reason == cbValueChange) {
+        vpiHandle h = store_cb("cbValueChange");
+
+        auto itH = g_handles.find(data->obj);
+        if (itH == g_handles.end()) {
+            DEBUG_LEAVE("vpi_register_cb (cbValueChange no-handle)");
+            return h;
+        }
+
+        const std::string &fq = itH->second->fqname;
+        auto itO = g_name2obj.find(fq);
+        if (itO == g_name2obj.end()) {
+            DEBUG_LEAVE("vpi_register_cb (cbValueChange no-obj)");
+            return h;
+        }
+
+        sc_core::sc_object *o = itO->second;
+
+        auto *s_bool = dynamic_cast<sc_core::sc_signal<bool>*>(o);
+        auto *s_int  = dynamic_cast<sc_core::sc_signal<int>*>(o);
+        auto *s_i4   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_int<4>>*>(o);
+        auto *s_u3   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<3>>*>(o);
+        auto *s_u4   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<4>>*>(o);
+        auto *s_u5   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<5>>*>(o);
+        auto *s_u8   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<8>>*>(o);
+        auto *s_u9   = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<9>>*>(o);
+        auto *s_u16  = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<16>>*>(o);
+        auto *s_u32  = dynamic_cast<sc_core::sc_signal<sc_dt::sc_uint<32>>*>(o);
+
+        const sc_core::sc_event *ev = nullptr;
+        if (s_bool)      ev = &s_bool->value_changed_event();
+        else if (s_int)  ev = &s_int->value_changed_event();
+        else if (s_i4)   ev = &s_i4->value_changed_event();
+        else if (s_u3)   ev = &s_u3->value_changed_event();
+        else if (s_u4)   ev = &s_u4->value_changed_event();
+        else if (s_u5)   ev = &s_u5->value_changed_event();
+        else if (s_u8)   ev = &s_u8->value_changed_event();
+        else if (s_u9)   ev = &s_u9->value_changed_event();
+        else if (s_u16)  ev = &s_u16->value_changed_event();
+        else if (s_u32)  ev = &s_u32->value_changed_event();
+
+        if (!ev) {
+            DEBUG_LEAVE("vpi_register_cb (cbValueChange unsupported)");
+            return h;
+        }
+
+        sc_core::sc_spawn([h, ev]() {
+            while (true) {
+                sc_core::wait(*ev);
+                auto it = g_cbs.find(h);
+                if (it == g_cbs.end()) break;
+
+                p_cb_data d = it->second->data;
+                if (!d || !d->cb_rtn) continue;
+
+                if (d->time)  vpi_get_time(d->obj, d->time);
+                if (d->value) vpi_get_value(d->obj, d->value);
+
+                d->cb_rtn(d);
+            }
+        }, sc_core::sc_gen_unique_name("scvpi_cbVC"));
+
+        DEBUG_LEAVE("vpi_register_cb (cbValueChange)");
+        return h;
+    }
+
+    DEBUG("vpi_register_cb: unsupported reason=0x%08x", data->reason);
+    DEBUG_LEAVE("vpi_register_cb (unsupported)");
+    return nullptr;
+}
+
+PLI_INT32 vpi_remove_cb(vpiHandle h) {
+    DEBUG_ENTER("vpi_remove_cb");
+
+    g_cbs.erase(h);
+
+    auto erase_from_vec = [h](std::vector<vpiHandle> &v) {
+        v.erase(std::remove(v.begin(), v.end(), h), v.end());
+    };
+
+    erase_from_vec(g_start_cbs);
+    erase_from_vec(g_end_cbs);
+
+    DEBUG_LEAVE("vpi_remove_cb");
+    return 0;
+}
+
+void vpi_get_cb_info(vpiHandle /*object*/, p_cb_data /*cb_data_p*/) { }
+
+vpiHandle vpi_handle_by_name(PLI_BYTE8 *name, vpiHandle scope) {
+    if (!name) return nullptr;
+
+    const std::string fq = fq_from_scope_and_name(scope, reinterpret_cast<const char*>(name));
+
+    auto itO = g_name2obj.find(fq);
+    if (itO == g_name2obj.end()) return nullptr;
+
+    sc_core::sc_object *obj = itO->second;
+    PLI_INT32 t = 0;
+
+    if (dynamic_cast<sc_core::sc_module*>(obj)) {
+        t = vpiModule;
+    } else {
+        int w = 1;
+        SignalKind k = classify(obj, w);
+        if (k == SigBool) {
+            t = vpiNet;
+        } else if (k != SigUnknown) {
+            t = vpiIntegerVar;
+        }
+    }
+
+    return (t != 0) ? make_handle(fq, t) : nullptr;
+}
+
+vpiHandle vpi_handle_by_index(vpiHandle /*object*/, PLI_INT32 /*index*/) { return nullptr; }
+
+vpiHandle vpi_handle(PLI_INT32 type, vpiHandle refHandle) {
+    if (!refHandle) return nullptr;
+
+    auto itH = g_handles.find(refHandle);
+    if (itH == g_handles.end()) return nullptr;
+
+    const std::string &fq = itH->second->fqname;
+
+    if (type == vpiScope) {
+        const std::string parent = parent_of(fq);
+        if (parent.empty()) return nullptr;
+
+        auto itO = g_name2obj.find(parent);
+        if (itO == g_name2obj.end()) return nullptr;
+
+        PLI_INT32 t = 0;
+        if (dynamic_cast<sc_core::sc_module*>(itO->second)) {
+            t = vpiModule;
+        } else {
+            int w = 1;
+            SignalKind k = classify(itO->second, w);
+            if (k == SigBool) t = vpiNet;
+            else if (k != SigUnknown) t = vpiIntegerVar;
+        }
+        return (t != 0) ? make_handle(parent, t) : nullptr;
+    }
+
+    if (type == vpiModule) {
+        if (itH->second->vpi_type == vpiModule) return refHandle;
+
+        std::string cur = fq;
+        while (true) {
+            auto pos = cur.rfind('.');
+            if (pos == std::string::npos) break;
+            cur.resize(pos);
+
+            auto itO = g_name2obj.find(cur);
+            if (itO != g_name2obj.end() && dynamic_cast<sc_core::sc_module*>(itO->second)) {
+                return make_handle(cur, vpiModule);
+            }
+        }
+        return nullptr;
+    }
+
+    return nullptr;
+}
+
+vpiHandle vpi_handle_multi(PLI_INT32 /*type*/, vpiHandle /*ref1*/, vpiHandle /*ref2*/, ...) { return nullptr; }
+
+vpiHandle vpi_iterate(PLI_INT32 type, vpiHandle refHandle) {
+    std::string parent;
+    if (refHandle) {
+        auto itH = g_handles.find(refHandle);
+        if (itH == g_handles.end()) return nullptr;
+        parent = itH->second->fqname;
+    } else {
+        parent = "";
+    }
+
+    if ((type == vpiInstance || type == vpiModule) && refHandle == nullptr) {
+        const std::vector<sc_core::sc_object*>& tops = sc_core::sc_get_top_level_objects();
+        auto itp = std::make_unique<IterRec>();
+        itp->elems.reserve(tops.size());
+
+        for (auto* t : tops) {
+            if (std::strcmp(t->name(), "__scvpi_plugin") == 0) continue;
+            const std::string fq2 = t->name();
+            if (!g_name2obj.count(fq2)) g_name2obj[fq2] = t;
+            itp->elems.push_back(make_handle(fq2, vpiModule));
+        }
+
+        if (itp->elems.empty()) return nullptr;
+
+        vpiHandle h = reinterpret_cast<vpiHandle>(itp.get());
+        g_iters.emplace(h, std::move(itp));
+        return h;
+    }
+
+    auto itp = std::make_unique<IterRec>();
+    collect_children(type, parent, itp->elems);
+
+    if (itp->elems.empty()) return nullptr;
+
+    vpiHandle h = reinterpret_cast<vpiHandle>(itp.get());
+    g_iters.emplace(h, std::move(itp));
+    return h;
+}
+
+vpiHandle vpi_scan(vpiHandle iterator) {
+    auto it = g_iters.find(iterator);
+    if (it == g_iters.end() || !it->second) return nullptr;
+
+    IterRec &I = *it->second;
+    if (I.idx >= I.elems.size()) {
+        g_iters.erase(it);
+        return nullptr;
+    }
+
+    vpiHandle h = I.elems[I.idx++];
+    return g_handles.count(h) ? h : nullptr;
+}
+
+PLI_INT32 vpi_get(PLI_INT32 property, vpiHandle object) {
+    if (!object) {
+        if (property == vpiTimePrecision || property == vpiTimeUnit) return -9;
+        return 0;
+    }
+
+    auto itH = g_handles.find(object);
+
+    if (property == vpiType) {
+        return (itH != g_handles.end()) ? itH->second->vpi_type : 0;
+    }
+
+    if (property == vpiSize) {
+        if (itH != g_handles.end()) {
+            const int w = itH->second->width;
+            return (w > 0) ? w : 1;
+        }
+        return 1;
+    }
+
+    if (property == vpiTimePrecision || property == vpiTimeUnit) return -9;
+
+    return 0;
+}
+
+PLI_INT64 vpi_get64(PLI_INT32 /*property*/, vpiHandle /*object*/) { return 0; }
+
+PLI_BYTE8 *vpi_get_str(PLI_INT32 property, vpiHandle object) {
+    if (!object) return nullptr;
+
+    auto itH = g_handles.find(object);
+    if (itH == g_handles.end()) return nullptr;
+
+    static thread_local std::string name_buf;
+
+    switch (property) {
+    case vpiFullName:
+        name_buf = itH->second->fqname;
+        return (PLI_BYTE8*)const_cast<char*>(name_buf.c_str());
+
+    case vpiName: {
+        const std::string &fq = itH->second->fqname;
+        auto pos = fq.rfind('.');
+        if (pos == std::string::npos) {
+            name_buf = fq;
+        } else {
+            name_buf = fq.substr(pos + 1);
+        }
+        return (PLI_BYTE8*)const_cast<char*>(name_buf.c_str());
+    }
+
+    default:
+        return nullptr;
+    }
+}
+
+void vpi_get_time(vpiHandle /*object*/, p_vpi_time time_p) {
+    if (!time_p) return;
+
+    const double sec = sc_core::sc_time_stamp().to_seconds();
+    const long double ns_ld = static_cast<long double>(sec) * 1.0e9L;
+    const uint64_t ns = static_cast<uint64_t>(std::floor(ns_ld + 0.5L));
+
+    time_p->type = vpiSimTime;
+    time_p->high = static_cast<uint32_t>(ns >> 32);
+    time_p->low  = static_cast<uint32_t>(ns & 0xffffffffULL);
+}
+
+void vpi_get_value(vpiHandle expr, p_vpi_value value_p) {
+    if (!expr || !value_p) return;
+
+    auto itH = g_handles.find(expr);
+    if (itH == g_handles.end()) return;
+
+    HandleRec *h = itH->second.get();
+    sc_core::sc_object *o = h->obj;
+    if (!o) {
+        auto itO = g_name2obj.find(h->fqname);
+        if (itO == g_name2obj.end()) return;
+        o = itO->second;
+        h->obj  = o;
+        h->kind = classify(o, h->width);
+    }
+
+    int ival = 0;
+    bool have_val = false;
+    int width = (h->width > 0) ? h->width : 1;
+
+    if (o && h->kind != SigUnknown) {
+        switch (h->kind) {
+        case SigInt32:
+            ival = static_cast<sc_core::sc_signal<int>*>(o)->read();
+            have_val = true;
+            break;
+        case SigInt4:
+            ival = static_cast<sc_core::sc_signal<sc_dt::sc_int<4>>*>(o)->read().to_int();
+            have_val = true;
+            break;
+        case SigBool:
+            ival = static_cast<sc_core::sc_signal<bool>*>(o)->read() ? 1 : 0;
+            have_val = true;
+            break;
+        case SigUInt3:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<3>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt4:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<4>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt5:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<5>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt8:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<8>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt9:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<9>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt16:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<16>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        case SigUInt32:
+            ival = static_cast<int>(static_cast<sc_core::sc_signal<sc_dt::sc_uint<32>>*>(o)->read().to_uint());
+            have_val = true;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (!have_val) return;
+
+    SCLOG("get %s = %d", h->fqname.c_str(), ival);
+
+    if (value_p->format == vpiBinStrVal) {
+        static thread_local std::string bin;
+        bin.assign(static_cast<size_t>(width), '0');
+
+        for (int i = 0; i < width; i++) {
+            const int bit = (ival >> i) & 1;
+            bin[static_cast<size_t>(width - 1 - i)] = bit ? '1' : '0';
+        }
+
+        bin.push_back('\0');
+        value_p->value.str = const_cast<char*>(bin.c_str());
+        return;
+    }
+
+    value_p->format = vpiIntVal;
+    value_p->value.integer = ival;
+}
+
+vpiHandle vpi_put_value(vpiHandle object, p_vpi_value value_p, p_vpi_time time_p, PLI_INT32 flags) {
+    if (!object || !value_p) return nullptr;
+
+    auto itH = g_handles.find(object);
+    if (itH == g_handles.end()) return nullptr;
+
+    int ival = 0;
+
+    switch (value_p->format) {
+    case vpiIntVal:
+        ival = value_p->value.integer;
+        break;
+    case vpiScalarVal:
+        ival = (value_p->value.scalar == vpi1) ? 1 : 0;
+        break;
+    case vpiBinStrVal: {
+        ival = 0;
+        const char* s = value_p->value.str;
+        if (s) {
+            for (const char* p = s; *p; ++p) {
+                if (*p == '0' || *p == '1') ival = (ival << 1) | ((*p == '1') ? 1 : 0);
+            }
+        } else {
+            ival = (value_p->value.integer != 0) ? 1 : 0;
+        }
+        break;
+    }
+    default:
+        return object;
+    }
+
+    SCLOG("put %s = %d", itH->second->fqname.c_str(), ival);
+
+    bool do_notify = false;
+    {
+        std::lock_guard<std::mutex> lk(g_write_mtx);
+
+        PendingWrite pw;
+        pw.handle = object;
+        pw.value  = ival;
+        g_pending_writes.push_back(pw);
+
+        if (!g_write_ev_pending) {
+            g_write_ev_pending = true;
+            do_notify = true;
+        }
+    }
+
+    start_driver_if_needed();
+
+    (void)time_p;
+    (void)flags;
+
+    if (do_notify) g_write_ev.notify(sc_core::SC_ZERO_TIME);
+    return object;
+}
+
+void vpi_get_delays(vpiHandle /*object*/, p_vpi_delay /*delay_p*/) { }
+void vpi_put_delays(vpiHandle /*object*/, p_vpi_delay /*delay_p*/) { }
+
+void vpi_get_value_array(vpiHandle /*object*/, p_vpi_arrayvalue /*arrayvalue_p*/,
+                         PLI_INT32* /*index_p*/, PLI_UINT32 /*num*/) { }
+void vpi_put_value_array(vpiHandle /*object*/, p_vpi_arrayvalue /*arrayvalue_p*/,
+                         PLI_INT32* /*index_p*/, PLI_UINT32 /*num*/) { }
+
+PLI_UINT32 vpi_mcd_open(PLI_BYTE8* /*fileName*/) { return 0; }
+PLI_UINT32 vpi_mcd_close(PLI_UINT32 /*mcd*/) { return 0; }
+PLI_BYTE8* vpi_mcd_name(PLI_UINT32 /*cd*/) { return 0; }
+PLI_INT32  vpi_mcd_printf(PLI_UINT32 /*mcd*/, PLI_BYTE8* /*format*/, ...) { return -1; }
+PLI_INT32  vpi_printf(PLI_BYTE8* /*format*/, ...) { return -1; }
+
+PLI_INT32 vpi_compare_objects(vpiHandle a, vpiHandle b) { return (a == b) ? 1 : 0; }
+
+PLI_INT32 vpi_chk_error(p_vpi_error_info err) {
+    if (err) {
+        err->state   = 0;
+        err->message = nullptr;
+        err->product = (PLI_BYTE8*)"SCVPI";
+        err->code    = 0;
+    }
+    return 0;
+}
+
+PLI_INT32 vpi_free_object(vpiHandle /*object*/) { return 1; }
+PLI_INT32 vpi_release_handle(vpiHandle /*object*/) { return -1; }
+
+PLI_INT32 vpi_get_vlog_info(p_vpi_vlog_info info_p) {
+    if (!info_p) return 0;
+
+    static char product[] = "SCVPI (SystemC)";
+    static char version[] = "SystemC";
+
+    static std::vector<PLI_BYTE8*> argv_buf;
+    argv_buf.clear();
+
+    const int argc = sc_core::sc_argc();
+    auto argv = sc_core::sc_argv();
+    for (int i = 0; i < argc; ++i) {
+        argv_buf.push_back(reinterpret_cast<PLI_BYTE8*>(const_cast<char*>(argv[i])));
+    }
+
+    info_p->product = reinterpret_cast<PLI_BYTE8*>(product);
+    info_p->version = reinterpret_cast<PLI_BYTE8*>(version);
+    info_p->argc    = argc;
+    info_p->argv    = argv_buf.data();
+    return 1;
+}
+
+PLI_INT32 vpi_get_data(PLI_INT32 /*id*/, PLI_BYTE8* /*dataLoc*/, PLI_INT32 /*numOfBytes*/) { return -1; }
+PLI_INT32 vpi_put_data(PLI_INT32 /*id*/, PLI_BYTE8* /*dataLoc*/, PLI_INT32 /*numOfBytes*/) { return -1; }
+
+void*     vpi_get_userdata(vpiHandle /*obj*/) { return 0; }
+PLI_INT32 vpi_put_userdata(vpiHandle /*obj*/, void* /*userdata*/) { return -1; }
+
+PLI_INT32 vpi_vprintf(PLI_BYTE8* /*format*/, va_list /*ap*/) { return -1; }
+PLI_INT32 vpi_mcd_vprintf(PLI_UINT32 /*mcd*/, PLI_BYTE8* /*format*/, va_list /*ap*/) { return 1; }
+
+PLI_INT32 vpi_flush(void) { return -1; }
+PLI_INT32 vpi_mcd_flush(PLI_UINT32 /*mcd*/) { return -1; }
+
+PLI_INT32 vpi_control(PLI_INT32 op, ...) {
+    if (op == vpiFinish || op == vpiStop) sc_core::sc_stop();
+    return 0;
+}
+
+vpiHandle vpi_handle_by_multi_index(vpiHandle /*obj*/, PLI_INT32 /*num_index*/, PLI_INT32* /*index_array*/) {
+    return 0;
+}
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
+#undef DEBUG_ENTER
+#undef DEBUG_LEAVE
+#undef DEBUG

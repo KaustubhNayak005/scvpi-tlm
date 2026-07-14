@@ -1,0 +1,54 @@
+/*
+ * ScVpiHandleIterator.icc - VPI iterator over SystemC objects
+ *
+ * SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework
+ * Created: 2026-07-14
+ * Author: Kaustubh <nayakkaustubh@gmail.com>
+ */
+
+#include <string.h>
+#include <systemc>
+#include "ScVpiHandleIterator.h"
+
+namespace scvpi {
+
+ScVpiHandleIterator::ScVpiHandleIterator(
+		const char								*kind,
+		const std::vector<sc_core::sc_object*> 	&items) :
+				ScVpiHandle(HandleKind_Iterator),
+				m_kind(kind), m_items(items), m_index(0) {
+
+}
+
+ScVpiHandleIterator::~ScVpiHandleIterator() {
+	// TODO Auto-generated destructor stub
+}
+
+sc_core::sc_object *ScVpiHandleIterator::next() {
+	sc_core::sc_object *ret = 0;
+	while (m_index < m_items.size()) {
+		// Should simplify
+		fprintf(stdout, "iterate: kind=%s\n", m_items.at(m_index)->kind());
+		if (equals(m_items.at(m_index)->kind(), m_kind)) {
+			ret = m_items.at(m_index);
+		}
+		m_index++;
+		if (ret) {
+			break;
+		}
+	}
+
+	return ret;
+}
+
+bool ScVpiHandleIterator::equals(const char *s1, const char *s2) {
+	//bool ret = true;
+
+	while ((*s1 && *s2) && (*s1==*s2)) {
+		s1++;
+		s2++;
+	}
+	return !(*s1 || *s2);
+}
+
+}

@@ -1,0 +1,40 @@
+/*
+ * ScVpiHandleObject.icc - VPI handle for a SystemC object
+ *
+ * SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework
+ * Created: 2026-07-14
+ * Author: Kaustubh <nayakkaustubh@gmail.com>
+ */
+
+#include "ScVpiHandleObject.h"
+#include "vpi_user_int.h"
+
+namespace scvpi {
+
+ScVpiHandleObject::ScVpiHandleObject() :
+	ScVpiHandle(HandleKind_Object), m_obj(0) {
+
+}
+
+ScVpiHandleObject::ScVpiHandleObject(sc_core::sc_object *obj) :
+	ScVpiHandle(HandleKind_Object), m_obj(obj) {
+
+}
+
+ScVpiHandleObject::~ScVpiHandleObject() {
+	// TODO Auto-generated destructor stub
+}
+
+const char *ScVpiHandleObject::name() const {
+	return m_obj->name();
+}
+
+int32_t ScVpiHandleObject::getVpiType() const {
+	if (!strcmp(m_obj->kind(), "sc_module")) {
+		return vpiModule;
+	} else {
+		return -1;
+	}
+}
+
+}
