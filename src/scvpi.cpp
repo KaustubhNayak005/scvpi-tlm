@@ -1,5 +1,5 @@
 /*
- * scvpi.cpp - SCVPI runtime implementation
+ * scvpi.cpp - SCVPI runtime and TLM transport implementation
  *
  * SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework
  * Created: 2026-07-14
@@ -8,6 +8,7 @@
  * Responsibilities:
  *  - load the cocotb VPI shim from the +vpi= command line
  *  - auto-register the SystemC object hierarchy for VPI access
+ *  - expose blocking TLM transport endpoints to Python
  */
 
 #include "scvpi.h"
@@ -24,6 +25,55 @@
 
 #include "scvpi_timed_callback.hpp"
 #include "ScVpiCallbackBase.h"
+
+#include "scvpi_tlm_bridge.h"
+
+#include <cstring>
+
+extern "C" int scvpi_tlm_transport_bytes(const char* endpoint,
+                                         int is_read,
+                                         uint64_t addr,
+                                         unsigned char* data,
+                                         uint32_t data_len,
+                                         const unsigned char* byte_en,
+                                         uint32_t byte_en_len,
+                                         int* rsp_status_out) {
+    if (!endpoint || !data || data_len == 0) {
+        return -1;
+    }
+
+    try {
+        scvpi_tlm_request req;
+        req.is_read = (is_read != 0);
+        req.addr = addr;
+        req.data.assign(data, data + data_len);
+
+        if (byte_en && byte_en_len > 0) {
+            req.byte_en.assign(byte_en, byte_en + byte_en_len);
+        }
+
+        auto rsp = scvpi_tlm_transport(endpoint, req);
+
+        const uint32_t copy_len =
+            (rsp.data.size() < data_len) ? static_cast<uint32_t>(rsp.data.size()) : data_len;
+
+        for (uint32_t i = 0; i < copy_len; i++) {
+            data[i] = rsp.data[i];
+        }
+
+        if (rsp_status_out) {
+            *rsp_status_out = rsp.response_status;
+        }
+
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "scvpi_tlm_transport_bytes exception: %s\n", e.what());
+        return -1;
+    } catch (...) {
+        fprintf(stderr, "scvpi_tlm_transport_bytes unknown exception\n");
+        return -1;
+    }
+}
 
 namespace scvpi {
 
