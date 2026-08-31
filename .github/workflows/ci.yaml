@@ -1,0 +1,122 @@
+name: SCVPI-TLM Regression
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  COCOTB_ANSI_OUTPUT: 1
+  FORCE_COLOR: 1
+  SYSTEMC: /opt/systemc-3.0.2
+  SYSTEMC_HOME: /opt/systemc-3.0.2
+
+jobs:
+  regression:
+    name: Linux / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            cpp \
+            iverilog \
+            wget
+
+      - name: Install SystemC 3.0.2
+        run: |
+          wget https://github.com/accellera-official/systemc/archive/refs/tags/3.0.2.tar.gz
+          tar -xzf 3.0.2.tar.gz
+          cmake -S systemc-3.0.2 -B systemc-build \
+            -DCMAKE_INSTALL_PREFIX="${SYSTEMC_HOME}" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build systemc-build -j"$(nproc)"
+          sudo cmake --install systemc-build
+
+      - name: Set up Python environment
+        run: |
+          uv venv --python "${{ matrix.python-version }}"
+          source .venv/bin/activate
+          uv sync --python "${{ matrix.python-version }}"
+
+      - name: Configure and build SCVPI bridge with CMake
+        run: |
+          source .venv/bin/activate
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${SYSTEMC_HOME}" \
+            -DSystemC_ROOT="${SYSTEMC_HOME}" \
+            -DPython3_EXECUTABLE="$(command -v python)"
+          cmake --build build -j"$(nproc)"
+
+      - name: Run standalone examples
+        run: |
+          source .venv/bin/activate
+          for ex in basic adder TinyALU_SystemC; do
+            make -C "examples/${ex}" show-config
+            make -C "examples/${ex}" run
+          done
+
+      - name: Run HDL RTL target
+        run: |
+          source .venv/bin/activate
+          make -C examples/tinyalu_reg show-config MODEL=hdl
+          make -C examples/tinyalu_reg run-hdl
+
+      - name: Run SystemC RTL target
+        run: |
+          source .venv/bin/activate
+          make -C examples/tinyalu_reg show-config MODEL=rtl
+          make -C examples/tinyalu_reg run-sc-rtl
+
+      - name: Run SystemC TLM target (annotated delay)
+        run: |
+          source .venv/bin/activate
+          make -C examples/tinyalu_reg show-config \
+            MODEL=tlm \
+            TLM_TARGET_CONSUMES_TIME=0
+          make -C examples/tinyalu_reg run-sc-tlm
+
+      - name: Run SystemC TLM target (target-side wait)
+        run: |
+          source .venv/bin/activate
+          make -C examples/tinyalu_reg clean
+          make -C examples/tinyalu_reg show-config \
+            MODEL=tlm \
+            TLM_TARGET_CONSUMES_TIME=1
+          make -C examples/tinyalu_reg run-sc-tlm-target-wait
+
+      - name: Upload cocotb results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cocotb-results
+          path: examples/**/results*.xml
+          if-no-files-found: warn
