@@ -100,3 +100,22 @@ The default `run-sc-tlm` target uses annotated-delay timing. The
 `run-sc-tlm-target-wait` target builds the same model with
 `TLM_TARGET_CONSUMES_TIME=1`, causing `b_transport()` to consume the bus
 latency with `sc_core::wait()`.
+
+### Target-side wait startup
+
+A SystemC `wait()` may only be called while an `SC_THREAD` or
+`SC_CTHREAD` is active. Some simulator integrations invoke the initial
+cocotb callback before a SystemC process has been entered.
+
+To ensure consistent behaviour across supported simulators, the Python
+TLM connector performs a one-time scheduler handoff before the first
+transaction when target-side wait mode is enabled. This resumes the
+coroutine from a valid SystemC callback context before invoking
+`b_transport()`.
+
+This scheduler handoff:
+
+- is performed only once,
+- is enabled only in target-side wait mode,
+- is not part of the modeled TLM bus latency, and
+- has no effect on annotated-delay mode.

@@ -3,13 +3,13 @@ name = "scvpi-tlm"
 version = "0.1.0"
 description = "SCVPI-TLM: Unified SystemC TLM-2.0 & SystemVerilog RTL Co-Verification Framework"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 authors = [
     { name = "Kaustubh", email = "nayakkaustubh@gmail.com" },
 ]
 license = { text = "Apache-2.0" }
 dependencies = [
-    "cocotb>=1.9.0",
-    "pytest>=8.0.0",
+    "cocotb>=2.0.1",
+    "pytest>=9.0.2",
     "pyuvm @ git+https://github.com/pyuvm/pyuvm.git",
 ]

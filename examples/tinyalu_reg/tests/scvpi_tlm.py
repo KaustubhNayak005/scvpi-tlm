@@ -6,6 +6,7 @@ from cocotb.triggers import Timer
 
 
 TLM_TARGET_CONSUMES_TIME = os.getenv("TLM_TARGET_CONSUMES_TIME", "0") == "1"
+_target_wait_context_ready = False
 
 
 class TlmRequest:
@@ -23,7 +24,19 @@ class TlmResponse:
         self.delay_ps = int(delay_ps)
 
 
+async def _ensure_target_wait_context() -> None:
+    global _target_wait_context_ready
+
+    if TLM_TARGET_CONSUMES_TIME and not _target_wait_context_ready:
+        await Timer(1, unit="step")
+        _target_wait_context_ready = True
+
+
 async def transport(endpoint: str, req: TlmRequest) -> TlmResponse:
+    # Required only by target-side wait mode. Annotated-delay mode does not
+    # call sc_core::wait() and therefore does not need this startup yield.
+    await _ensure_target_wait_context()
+
     be = req.byte_en if req.byte_en is not None else None
 
     data, rsp_status, delay_ps = scvpi_tlm_ext.transport(
